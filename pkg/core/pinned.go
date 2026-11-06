@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/go-github/v57/github"
 	"github.com/traefik/piceus/pkg/audit"
+	"golang.org/x/mod/modfile"
 )
 
 // errPinnedCommit is returned when the Go module proxy cannot be read: it is not a plugin problem.
@@ -19,22 +21,55 @@ type PinnedCommit func(ctx context.Context, module, version string) (string, err
 
 // yaegiRef returns the ref to read the Yaegi plugin from: the commit the Go module proxy pinned at publication,
 // that plugin-service serves once the tag moved, or the tag when the proxy pinned none.
-func (s *Scrapper) yaegiRef(ctx context.Context, repository *github.Repository, version string) (string, error) {
+// When the ref is the tag, it also returns the go.mod read at the tag, or nil when it did not read it.
+func (s *Scrapper) yaegiRef(ctx context.Context, repository *github.Repository, latest tag) (string, *modfile.File, error) {
+	version := latest.Name
+
 	// The Go module proxy cannot fetch a private repository: do not send it its name.
 	if s.pinnedCommit == nil || repository.GetPrivate() {
-		return version, nil
+		return version, nil, nil
 	}
 
 	mod, err := s.getModuleInfo(ctx, repository, version)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	if mod.Module == nil {
-		return version, nil
+		return version, mod, nil
 	}
 
+	pinned, err := s.pinnedCommitWithRetry(ctx, mod.Module.Mod.Path, version)
+
+	switch {
+	case errors.Is(err, audit.ErrNotPinned):
+		return version, mod, nil
+	case err != nil:
+		return "", nil, fmt.Errorf("%w: %w", errPinnedCommit, err)
+	}
+
+	// The tag did not move: the files at the tag are the pinned ones.
+	if latest.SHA != "" && strings.EqualFold(pinned, latest.SHA) {
+		return version, mod, nil
+	}
+
+	// plugin-service serves the tag once the pinned commit is gone from GitHub.
+	gone, err := s.commitGone(ctx, repository, pinned)
+	if err != nil {
+		return "", nil, err
+	}
+
+	if gone {
+		return version, mod, nil
+	}
+
+	return pinned, nil, nil
+}
+
+// pinnedCommitWithRetry calls pinnedCommit, and tries again twice when the Go module proxy fails.
+func (s *Scrapper) pinnedCommitWithRetry(ctx context.Context, module, version string) (string, error) {
 	var pinned string
+	var err error
 
 	for attempt := range 3 {
 		if attempt > 0 {
@@ -45,30 +80,13 @@ func (s *Scrapper) yaegiRef(ctx context.Context, repository *github.Repository, 
 			}
 		}
 
-		pinned, err = s.pinnedCommit(ctx, mod.Module.Mod.Path, version)
+		pinned, err = s.pinnedCommit(ctx, module, version)
 		if err == nil || errors.Is(err, audit.ErrNotPinned) {
 			break
 		}
 	}
 
-	switch {
-	case errors.Is(err, audit.ErrNotPinned):
-		return version, nil
-	case err != nil:
-		return "", fmt.Errorf("%w: %w", errPinnedCommit, err)
-	}
-
-	// plugin-service serves the tag once the pinned commit is gone from GitHub.
-	gone, err := s.commitGone(ctx, repository, pinned)
-	if err != nil {
-		return "", err
-	}
-
-	if gone {
-		return version, nil
-	}
-
-	return pinned, nil
+	return pinned, err
 }
 
 // commitGone reports whether GitHub no longer has the commit sha.

@@ -15,17 +15,17 @@ import (
 
 const wasmFile = "plugin.wasm"
 
-func (s *Scrapper) verifyWASMPlugin(ctx context.Context, repository *github.Repository, latestVersion string, manifest Manifest) (string, []string, error) {
+func (s *Scrapper) verifyWASMPlugin(ctx context.Context, repository *github.Repository, tags []tag, manifest Manifest) (string, []string, error) {
 	pluginName := path.Join("github.com", repository.GetFullName())
 
 	// skip already existing plugin
 	prev, err := s.pg.GetByName(ctx, pluginName)
-	if err == nil && prev != nil && prev.LatestVersion == latestVersion && prev.Stars == repository.GetStargazersCount() {
+	if err == nil && prev != nil && prev.LatestVersion == tags[0].Name && prev.Stars == repository.GetStargazersCount() {
 		return "", nil, nil
 	}
 
 	// Get versions
-	versions, err := s.getVersions(ctx, repository, pluginName)
+	versions, err := s.getVersions(ctx, pluginName, tags)
 	if err != nil {
 		return "", nil, err
 	}
