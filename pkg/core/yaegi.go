@@ -16,19 +16,28 @@ import (
 // errGoProxy is returned when the Go module proxy cannot be read: it is not a plugin problem.
 var errGoProxy = errors.New("failed to read the Go module proxy")
 
-// verifyYaegiPlugin checks the plugin at latestVersion, its go.mod read at ref.
-func (s *Scrapper) verifyYaegiPlugin(ctx context.Context, repository *github.Repository, latestVersion, ref string, manifest Manifest) (string, []string, error) {
+// verifyYaegiPlugin checks the plugin at its latest tag, its go.mod read at ref.
+// mod is the go.mod already read at ref, or nil.
+func (s *Scrapper) verifyYaegiPlugin(ctx context.Context, repository *github.Repository, tags []tag, ref string, mod *modfile.File, manifest Manifest) (string, []string, error) {
 	// Gets module information
-	mod, err := s.getModuleInfo(ctx, repository, ref)
-	if err != nil {
-		return "", nil, err
+	if mod == nil {
+		var err error
+
+		mod, err = s.getModuleInfo(ctx, repository, ref)
+		if err != nil {
+			return "", nil, err
+		}
+	}
+
+	if mod.Module == nil {
+		return "", nil, errors.New("missing module directive in go.mod")
 	}
 
 	pluginName := mod.Module.Mod.Path
 
 	// skip already existing plugin
 	prev, err := s.pg.GetByName(ctx, pluginName)
-	if err == nil && prev != nil && prev.LatestVersion == latestVersion && prev.Stars == repository.GetStargazersCount() {
+	if err == nil && prev != nil && prev.LatestVersion == tags[0].Name && prev.Stars == repository.GetStargazersCount() {
 		return "", nil, nil
 	}
 
@@ -46,14 +55,14 @@ func (s *Scrapper) verifyYaegiPlugin(ctx context.Context, repository *github.Rep
 	// plugin-service downloads a public plugin from the Go module proxy.
 	// The Go module proxy cannot fetch a private repository: do not send it its name.
 	if !repository.GetPrivate() {
-		err = s.checkProxyVersion(ctx, pluginName, latestVersion)
+		err = s.checkProxyVersion(ctx, pluginName, tags[0].Name)
 		if err != nil {
 			return "", nil, err
 		}
 	}
 
 	// Get versions
-	versions, err := s.getVersions(ctx, repository, pluginName)
+	versions, err := s.getVersions(ctx, pluginName, tags)
 	if err != nil {
 		return "", nil, err
 	}
