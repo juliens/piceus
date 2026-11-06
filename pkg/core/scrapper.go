@@ -24,6 +24,7 @@ import (
 	"github.com/traefik/piceus/internal/plugin"
 	"go.opentelemetry.io/otel"
 	oteltrace "go.opentelemetry.io/otel/trace"
+	"golang.org/x/mod/modfile"
 	"gopkg.in/yaml.v3"
 )
 
@@ -293,11 +294,17 @@ func (s *Scrapper) process(ctx context.Context, repository *github.Repository) (
 	ctx, span := s.tracer.Start(ctx, "scrapper_process_"+repository.GetName())
 	defer span.End()
 
-	latestVersion, err := s.getLatestTag(ctx, repository)
+	tags, err := s.getTags(ctx, repository)
+	if err == nil && len(tags) == 0 {
+		err = errors.New("missing tag/version")
+	}
+
 	if err != nil {
 		span.RecordError(err)
 		return nil, fmt.Errorf("failed to get the latest tag: %w", err)
 	}
+
+	latestVersion := tags[0].Name
 
 	// Gets manifestFile
 
@@ -310,8 +317,12 @@ func (s *Scrapper) process(ctx context.Context, repository *github.Repository) (
 	// The code is read at the pinned commit: so are its manifest and readme.
 
 	ref := latestVersion
+
+	// mod is the go.mod read at the tag, to read it only once.
+	var mod *modfile.File
+
 	if manifest.Runtime != wasmRuntime {
-		ref, err = s.yaegiRef(ctx, repository, latestVersion)
+		ref, mod, err = s.yaegiRef(ctx, repository, tags[0])
 		if err != nil {
 			span.RecordError(err)
 			return nil, err
@@ -346,7 +357,7 @@ func (s *Scrapper) process(ctx context.Context, repository *github.Repository) (
 
 	switch manifest.Runtime {
 	case wasmRuntime:
-		pluginName, versions, err = s.verifyWASMPlugin(ctx, repository, latestVersion, manifest)
+		pluginName, versions, err = s.verifyWASMPlugin(ctx, repository, tags, manifest)
 		if err != nil {
 			span.RecordError(err)
 			return nil, err
@@ -357,7 +368,7 @@ func (s *Scrapper) process(ctx context.Context, repository *github.Repository) (
 		}
 
 	default:
-		pluginName, versions, err = s.verifyYaegiPlugin(ctx, repository, latestVersion, ref, manifest)
+		pluginName, versions, err = s.verifyYaegiPlugin(ctx, repository, tags, ref, mod, manifest)
 		if err != nil {
 			span.RecordError(err)
 			return nil, err
@@ -490,34 +501,18 @@ func (s *Scrapper) loadReadme(ctx context.Context, repository *github.Repository
 	return content, nil
 }
 
-func (s *Scrapper) getLatestTag(ctx context.Context, repository *github.Repository) (string, error) {
-	ctx, span := s.tracer.Start(ctx, "scrapper_getLatestTag")
-	defer span.End()
-
-	tags, err := s.getTags(ctx, repository)
-	if err != nil {
-		span.RecordError(err)
-		return "", err
-	}
-
-	if len(tags) == 0 {
-		err := errors.New("missing tag/version")
-		span.RecordError(err)
-		return "", err
-	}
-
-	return tags[0], nil
-}
-
-func (s *Scrapper) getVersions(ctx context.Context, repository *github.Repository, moduleName string) ([]string, error) {
-	ctx, span := s.tracer.Start(ctx, "scrapper_getVersions")
+// getVersions returns the versions of the plugin. In private mode, they are the GitHub tags, already listed.
+func (s *Scrapper) getVersions(ctx context.Context, moduleName string, tags []tag) ([]string, error) {
+	_, span := s.tracer.Start(ctx, "scrapper_getVersions")
 	defer span.End()
 
 	var versions []string
 	var err error
 
 	if _, ok := os.LookupEnv(PrivateModeEnv); ok {
-		versions, err = s.getTags(ctx, repository)
+		for _, t := range tags {
+			versions = append(versions, t.Name)
+		}
 	} else {
 		versions, err = s.gp.GetVersions(moduleName)
 	}
@@ -536,7 +531,14 @@ func (s *Scrapper) getVersions(ctx context.Context, repository *github.Repositor
 	return versions, err
 }
 
-func (s *Scrapper) getTags(ctx context.Context, repository *github.Repository) ([]string, error) {
+// tag is a Git tag of the plugin repository.
+type tag struct {
+	Name string
+	// SHA is the commit of the tag.
+	SHA string
+}
+
+func (s *Scrapper) getTags(ctx context.Context, repository *github.Repository) ([]tag, error) {
 	ctx, span := s.tracer.Start(ctx, "scrapper_getTags")
 	defer span.End()
 
@@ -548,9 +550,9 @@ func (s *Scrapper) getTags(ctx context.Context, repository *github.Repository) (
 
 	expSemver := regexp.MustCompile(`^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$`)
 
-	var result []string
-	for _, tag := range tags {
-		name := tag.GetName()
+	var result []tag
+	for _, t := range tags {
+		name := t.GetName()
 		if name == "" {
 			continue
 		}
@@ -559,7 +561,7 @@ func (s *Scrapper) getTags(ctx context.Context, repository *github.Repository) (
 			return nil, fmt.Errorf("invalid tag: %s (this tag must be removed, see https://go.dev/doc/modules/version-numbers)", name)
 		}
 
-		result = append(result, name)
+		result = append(result, tag{Name: name, SHA: t.GetCommit().GetSHA()})
 	}
 
 	return result, nil

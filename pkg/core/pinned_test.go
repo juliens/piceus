@@ -48,18 +48,23 @@ func TestScrapper_yaegiRef(t *testing.T) {
 		private  bool
 		results  []error // one per call to the proxy, the last one repeats; nil gives the pinned commit
 		noProxy  bool
+		tagSHA   string // the commit of the tag
 		ref      string
+		withMod  bool // the go.mod read at the tag is returned
 		calls    int
 		wantErr  bool
 		proxyErr bool
 	}{
 		{desc: "pinned", results: []error{nil}, ref: "abc123", calls: 1},
-		{desc: "not pinned", results: []error{audit.ErrNotPinned}, ref: "v1.0.0", calls: 1},
+		{desc: "pinned commit is the tag commit", tagSHA: "ABC123", results: []error{nil}, ref: "v1.0.0", withMod: true, calls: 1},
+		{desc: "tag moved", tagSHA: "def456", results: []error{nil}, ref: "abc123", calls: 1},
+		{desc: "pinned commit is the tag commit, commit check down", repo: "down", tagSHA: "abc123", results: []error{nil}, ref: "v1.0.0", withMod: true, calls: 1},
+		{desc: "not pinned", results: []error{audit.ErrNotPinned}, ref: "v1.0.0", withMod: true, calls: 1},
 		{desc: "proxy back after a hiccup", results: []error{errors.New("502"), nil}, ref: "abc123", calls: 2},
 		{desc: "proxy down", results: []error{errors.New("502")}, calls: 3, wantErr: true, proxyErr: true},
 		{desc: "private repository", private: true, results: []error{nil}, ref: "v1.0.0"},
 		{desc: "no proxy", noProxy: true, ref: "v1.0.0"},
-		{desc: "pinned commit gone", repo: "gone", results: []error{nil}, ref: "v1.0.0", calls: 1},
+		{desc: "pinned commit gone", repo: "gone", results: []error{nil}, ref: "v1.0.0", withMod: true, calls: 1},
 		{desc: "commit check down", repo: "down", results: []error{nil}, calls: 1, wantErr: true},
 	}
 
@@ -81,7 +86,7 @@ func TestScrapper_yaegiRef(t *testing.T) {
 
 			repository := &github.Repository{Name: new(repo), Owner: &github.User{Login: new("o")}, Private: new(test.private)}
 
-			ref, err := s.yaegiRef(t.Context(), repository, "v1.0.0")
+			ref, mod, err := s.yaegiRef(t.Context(), repository, tag{Name: "v1.0.0", SHA: test.tagSHA})
 			if calls != nil {
 				assert.Equal(t, test.calls, *calls)
 			}
@@ -95,6 +100,13 @@ func TestScrapper_yaegiRef(t *testing.T) {
 
 			require.NoError(t, err)
 			assert.Equal(t, test.ref, ref)
+
+			if test.withMod {
+				require.NotNil(t, mod)
+				assert.Equal(t, "github.com/o/r", mod.Module.Mod.Path)
+			} else {
+				assert.Nil(t, mod)
+			}
 		})
 	}
 }
@@ -159,8 +171,13 @@ func TestScrapper_process_movedTag(t *testing.T) {
 			assert.Equal(t, test.readme, p.Readme)
 			assert.Equal(t, "v1.0.0", p.LatestVersion)
 
-			// go.mod is read at the tag to find the module name, then at the ref to check the plugin.
-			assert.Equal(t, []string{"v1.0.0", test.ref}, reads["go.mod"])
+			// go.mod is read at the tag to find the module name, then at the ref to check the plugin when the ref is not the tag.
+			expectedReads := []string{"v1.0.0"}
+			if test.ref != "v1.0.0" {
+				expectedReads = append(expectedReads, test.ref)
+			}
+
+			assert.Equal(t, expectedReads, reads["go.mod"])
 		})
 	}
 }
@@ -189,23 +206,82 @@ func newFakeGoProxy(t *testing.T, status int) *goproxy.Client {
 	return goproxy.NewClient(server.URL)
 }
 
+// TestScrapper_process_githubRequests checks that a Yaegi plugin whose tag did not move reads each file once.
+func TestScrapper_process_githubRequests(t *testing.T) {
+	// The versions come from the GitHub tags, not from the Go proxy.
+	t.Setenv(PrivateModeEnv, "true")
+
+	fixtureDir := filepath.Join("fixtures", "simple")
+
+	manifest, err := os.ReadFile(filepath.Join(fixtureDir, manifestFile))
+	require.NoError(t, err)
+
+	goMod, err := os.ReadFile(filepath.Join(fixtureDir, "go.mod"))
+	require.NoError(t, err)
+
+	files := map[string]string{
+		manifestFile + "@v1.0.0": string(manifest) + "\ntestData: {}\n",
+		"go.mod@v1.0.0":          string(goMod),
+	}
+
+	requests := map[string]int{}
+
+	// The Go module proxy pinned the commit of the tag.
+	s := NewScrapper(newFakeGitHubWithTag(t, files, map[string]string{"v1.0.0": "# Plugin"}, "abc123", requests, nil), newFakeGoProxy(t, http.StatusOK), &mockPluginClient{}, true,
+		func(context.Context, string, string) (string, error) { return "abc123", nil },
+		nil, nil)
+
+	repository := &github.Repository{
+		Name:     new("plugintestsimple"),
+		FullName: new("traefik/plugintestsimple"),
+		Owner:    &github.User{Login: new("traefik")},
+	}
+
+	p, err := s.process(t.Context(), repository)
+	require.NoError(t, err)
+	require.NotNil(t, p)
+
+	assert.Equal(t, []string{"v1.0.0"}, p.Versions)
+
+	expected := map[string]int{
+		"GET /repos/{owner}/{repo}/tags":               1,
+		"GET /repos/{owner}/{repo}/contents/{path...}": 2, // the manifest and the go.mod
+		"GET /repos/{owner}/{repo}/readme":             1,
+	}
+	assert.Equal(t, expected, requests)
+}
+
 // newFakeGitHub serves the tag v1.0.0, files keyed by path@ref and readmes keyed by ref.
 // A commit exists when a file is keyed by it, except in the repository gone; the repository down fails the commit check.
 func newFakeGitHub(t *testing.T, files, readmes map[string]string) *github.Client {
 	t.Helper()
 
-	return newFakeGitHubRecording(t, files, readmes, nil)
+	return newFakeGitHubWithTag(t, files, readmes, "", nil, nil)
 }
 
-// newFakeGitHubRecording is newFakeGitHub that also records, in reads when it is not nil, the refs each file is read at.
+// newFakeGitHubRecording is newFakeGitHub that also records, in reads, the refs each file is read at.
 func newFakeGitHubRecording(t *testing.T, files, readmes map[string]string, reads map[string][]string) *github.Client {
+	t.Helper()
+
+	return newFakeGitHubWithTag(t, files, readmes, "", nil, reads)
+}
+
+// newFakeGitHubWithTag is newFakeGitHub with tagSHA as the commit of the tag v1.0.0.
+// When requests is not nil, it counts the requests by method and path pattern.
+// When reads is not nil, it records the refs each file is read at.
+func newFakeGitHubWithTag(t *testing.T, files, readmes map[string]string, tagSHA string, requests map[string]int, reads map[string][]string) *github.Client {
 	t.Helper()
 
 	var mu sync.Mutex
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /repos/{owner}/{repo}/tags", func(rw http.ResponseWriter, _ *http.Request) {
-		writeJSON(t, rw, http.StatusOK, []*github.RepositoryTag{{Name: new("v1.0.0")}})
+		repoTag := &github.RepositoryTag{Name: new("v1.0.0")}
+		if tagSHA != "" {
+			repoTag.Commit = &github.Commit{SHA: new(tagSHA)}
+		}
+
+		writeJSON(t, rw, http.StatusOK, []*github.RepositoryTag{repoTag})
 	})
 	mux.HandleFunc("GET /repos/{owner}/{repo}/readme", func(rw http.ResponseWriter, req *http.Request) {
 		content, ok := readmes[req.URL.Query().Get("ref")]
@@ -242,7 +318,17 @@ func newFakeGitHubRecording(t *testing.T, files, readmes map[string]string, read
 		writeJSON(t, rw, http.StatusOK, fileContent(content))
 	})
 
-	server := httptest.NewServer(mux)
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		if requests != nil {
+			_, pattern := mux.Handler(req)
+
+			mu.Lock()
+			requests[pattern]++
+			mu.Unlock()
+		}
+
+		mux.ServeHTTP(rw, req)
+	}))
 	t.Cleanup(server.Close)
 
 	client := github.NewClient(nil)
