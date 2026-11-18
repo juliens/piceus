@@ -32,4 +32,29 @@ type Plugin struct {
 	CreatedAt     time.Time      `json:"createdAt"`
 	Hidden        bool           `json:"hidden,omitempty"`
 	UseUnsafe     bool           `json:"useUnsafe,omitempty"`
+	// TagsETag is the ETag of the GitHub tags response the plugin was read from.
+	TagsETag string `json:"tagsETag,omitempty"`
+}
+
+// State is the part of a plugin that tells if it changed since the last run.
+type State struct {
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	LatestVersion string `json:"latestVersion"`
+	Stars         int    `json:"stars"`
+	Hidden        bool   `json:"hidden"`
+	Disabled      bool   `json:"disabled"`
+	TagsETag      string `json:"tagsETag"`
+}
+
+// Patch holds the plugin fields to update alone. A nil field is not updated.
+type Patch struct {
+	Stars    *int    `json:"stars,omitempty"`
+	Hidden   *bool   `json:"hidden,omitempty"`
+	TagsETag *string `json:"tagsETag,omitempty"`
+}
+
+// IsEmpty reports whether the patch updates nothing.
+func (p Patch) IsEmpty() bool {
+	return p.Stars == nil && p.Hidden == nil && p.TagsETag == nil
 }

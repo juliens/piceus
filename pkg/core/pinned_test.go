@@ -227,7 +227,9 @@ func TestScrapper_process_githubRequests(t *testing.T) {
 	requests := map[string]int{}
 
 	// The Go module proxy pinned the commit of the tag.
-	s := NewScrapper(newFakeGitHubWithTag(t, files, map[string]string{"v1.0.0": "# Plugin"}, "abc123", requests, nil), newFakeGoProxy(t, http.StatusOK), &mockPluginClient{}, true,
+	gh := fakeGitHub{files: files, readmes: map[string]string{"v1.0.0": "# Plugin"}, tagSHA: "abc123", requests: requests}.client(t)
+
+	s := NewScrapper(gh, newFakeGoProxy(t, http.StatusOK), &mockPluginClient{}, true,
 		func(context.Context, string, string) (string, error) { return "abc123", nil },
 		nil, nil)
 
@@ -256,29 +258,52 @@ func TestScrapper_process_githubRequests(t *testing.T) {
 func newFakeGitHub(t *testing.T, files, readmes map[string]string) *github.Client {
 	t.Helper()
 
-	return newFakeGitHubWithTag(t, files, readmes, "", nil, nil)
+	return fakeGitHub{files: files, readmes: readmes}.client(t)
 }
 
 // newFakeGitHubRecording is newFakeGitHub that also records, in reads, the refs each file is read at.
 func newFakeGitHubRecording(t *testing.T, files, readmes map[string]string, reads map[string][]string) *github.Client {
 	t.Helper()
 
-	return newFakeGitHubWithTag(t, files, readmes, "", nil, reads)
+	return fakeGitHub{files: files, readmes: readmes, reads: reads}.client(t)
 }
 
-// newFakeGitHubWithTag is newFakeGitHub with tagSHA as the commit of the tag v1.0.0.
-// When requests is not nil, it counts the requests by method and path pattern.
-// When reads is not nil, it records the refs each file is read at.
-func newFakeGitHubWithTag(t *testing.T, files, readmes map[string]string, tagSHA string, requests map[string]int, reads map[string][]string) *github.Client {
+// fakeGitHub serves the tag v1.0.0, files keyed by path@ref and readmes keyed by ref.
+// A commit exists when a file is keyed by it, except in the repository gone; the repository down fails the commit check.
+type fakeGitHub struct {
+	files   map[string]string
+	readmes map[string]string
+	// tagSHA is the commit of the tag v1.0.0.
+	tagSHA string
+	// tagsETag is the ETag of the tags response: a request with this If-None-Match gets a 304.
+	tagsETag string
+	// requests, when not nil, counts the requests by method and path pattern.
+	requests map[string]int
+	// reads, when not nil, records the refs each file is read at.
+	reads map[string][]string
+}
+
+func (f fakeGitHub) client(t *testing.T) *github.Client {
 	t.Helper()
+
+	files, readmes, requests, reads := f.files, f.readmes, f.requests, f.reads
 
 	var mu sync.Mutex
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /repos/{owner}/{repo}/tags", func(rw http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /repos/{owner}/{repo}/tags", func(rw http.ResponseWriter, req *http.Request) {
+		if f.tagsETag != "" {
+			if req.Header.Get("If-None-Match") == f.tagsETag {
+				rw.WriteHeader(http.StatusNotModified)
+				return
+			}
+
+			rw.Header().Set("ETag", f.tagsETag)
+		}
+
 		repoTag := &github.RepositoryTag{Name: new("v1.0.0")}
-		if tagSHA != "" {
-			repoTag.Commit = &github.Commit{SHA: new(tagSHA)}
+		if f.tagSHA != "" {
+			repoTag.Commit = &github.Commit{SHA: new(f.tagSHA)}
 		}
 
 		writeJSON(t, rw, http.StatusOK, []*github.RepositoryTag{repoTag})

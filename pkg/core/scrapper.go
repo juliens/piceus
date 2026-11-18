@@ -64,6 +64,8 @@ type pluginClient interface {
 	Update(ctx context.Context, p plugin.Plugin) error
 	GetByName(ctx context.Context, name string) (*plugin.Plugin, error)
 	ListBlacklist(ctx context.Context) ([]plugin.BlacklistEntry, error)
+	ListStates(ctx context.Context) ([]plugin.State, error)
+	Patch(ctx context.Context, id string, patch plugin.Patch) error
 }
 
 // Scrapper the plugins scrapper.
@@ -80,7 +82,9 @@ type Scrapper struct {
 	pinnedCommit PinnedCommit // nil when the plugin is read at the tag
 	retryWait    time.Duration
 	blacklist    map[string]struct{}
-	tracer       oteltrace.Tracer
+	// states are the plugin states by repository (owner/repo in lower case), loaded at the start of each Run.
+	states map[string][]plugin.State
+	tracer oteltrace.Tracer
 }
 
 // NewScrapper creates a new Scrapper instance.
@@ -113,6 +117,8 @@ func (s *Scrapper) Run(ctx context.Context) error {
 		span.RecordError(err)
 		return err
 	}
+
+	s.loadStates(ctx)
 
 	reposWithExistingIssue, err := s.searchReposWithExistingIssue(ctx)
 	if err != nil {
@@ -294,7 +300,20 @@ func (s *Scrapper) process(ctx context.Context, repository *github.Repository) (
 	ctx, span := s.tracer.Start(ctx, "scrapper_process_"+repository.GetName())
 	defer span.End()
 
-	tags, err := s.getTags(ctx, repository)
+	state, known := s.stateOf(repository)
+
+	if known && state.Disabled {
+		log.Ctx(ctx).Debug().Msg("Disabled plugin, skipped")
+		return nil, nil
+	}
+
+	tags, tagsETag, notModified, err := s.getTags(ctx, repository, state.TagsETag)
+	if err == nil && notModified {
+		// The tags did not change since the last run: neither did the plugin.
+		s.patchState(ctx, state, repository, "")
+		return nil, nil
+	}
+
 	if err == nil && len(tags) == 0 {
 		err = errors.New("missing tag/version")
 	}
@@ -358,25 +377,22 @@ func (s *Scrapper) process(ctx context.Context, repository *github.Repository) (
 	switch manifest.Runtime {
 	case wasmRuntime:
 		pluginName, versions, err = s.verifyWASMPlugin(ctx, repository, tags, manifest)
-		if err != nil {
-			span.RecordError(err)
-			return nil, err
-		}
-
-		if pluginName == "" {
-			return nil, nil
-		}
-
 	default:
 		pluginName, versions, err = s.verifyYaegiPlugin(ctx, repository, tags, ref, mod, manifest)
-		if err != nil {
-			span.RecordError(err)
-			return nil, err
+	}
+
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+
+	// plugin-service already has this version: record the ETag, so the next run gets a 304.
+	if pluginName == "" {
+		if known {
+			s.patchState(ctx, state, repository, tagsETag)
 		}
 
-		if pluginName == "" {
-			return nil, nil
-		}
+		return nil, nil
 	}
 
 	snippets, err := createSnippets(repository, manifest)
@@ -404,6 +420,7 @@ func (s *Scrapper) process(ctx context.Context, repository *github.Repository) (
 		Snippet:       snippets,
 		Hidden:        slices.Contains(repository.Topics, hiddenTopic),
 		UseUnsafe:     manifest.UseUnsafe,
+		TagsETag:      tagsETag,
 	}, nil
 }
 
@@ -538,19 +555,38 @@ type tag struct {
 	SHA string
 }
 
-func (s *Scrapper) getTags(ctx context.Context, repository *github.Repository) ([]tag, error) {
+// getTags returns the tags of the repository and the ETag of the response.
+// When etag is not empty and the tags did not change, it returns notModified: GitHub answers 304,
+// and a 304 is not counted in the GitHub rate limit.
+func (s *Scrapper) getTags(ctx context.Context, repository *github.Repository, etag string) (result []tag, tagsETag string, notModified bool, err error) {
 	ctx, span := s.tracer.Start(ctx, "scrapper_getTags")
 	defer span.End()
 
-	tags, _, err := s.gh.Repositories.ListTags(ctx, repository.GetOwner().GetLogin(), repository.GetName(), nil)
+	// The same request as Repositories.ListTags, with the If-None-Match header.
+	req, err := s.gh.NewRequest(http.MethodGet, fmt.Sprintf("repos/%v/%v/tags", repository.GetOwner().GetLogin(), repository.GetName()), nil)
 	if err != nil {
 		span.RecordError(err)
-		return nil, fmt.Errorf("failed to get versions: %w", err)
+		return nil, "", false, fmt.Errorf("failed to create the tags request: %w", err)
+	}
+
+	if etag != "" {
+		req.Header.Set("If-None-Match", etag)
+	}
+
+	var tags []*github.RepositoryTag
+
+	resp, err := s.gh.Do(ctx, req, &tags)
+	if etag != "" && resp != nil && resp.StatusCode == http.StatusNotModified {
+		return nil, etag, true, nil
+	}
+
+	if err != nil {
+		span.RecordError(err)
+		return nil, "", false, fmt.Errorf("failed to get versions: %w", err)
 	}
 
 	expSemver := regexp.MustCompile(`^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$`)
 
-	var result []tag
 	for _, t := range tags {
 		name := t.GetName()
 		if name == "" {
@@ -558,13 +594,13 @@ func (s *Scrapper) getTags(ctx context.Context, repository *github.Repository) (
 		}
 
 		if !expSemver.MatchString(name) {
-			return nil, fmt.Errorf("invalid tag: %s (this tag must be removed, see https://go.dev/doc/modules/version-numbers)", name)
+			return nil, "", false, fmt.Errorf("invalid tag: %s (this tag must be removed, see https://go.dev/doc/modules/version-numbers)", name)
 		}
 
 		result = append(result, tag{Name: name, SHA: t.GetCommit().GetSHA()})
 	}
 
-	return result, nil
+	return result, resp.Header.Get("ETag"), false, nil
 }
 
 func (s *Scrapper) store(ctx context.Context, data *plugin.Plugin) error {

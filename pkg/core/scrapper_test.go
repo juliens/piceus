@@ -28,6 +28,8 @@ type mockPluginClient struct {
 	update        func(p plugin.Plugin) error
 	getByName     func(string) (*plugin.Plugin, error)
 	listBlacklist func() ([]plugin.BlacklistEntry, error)
+	listStates    func() ([]plugin.State, error)
+	patch         func(id string, patch plugin.Patch) error
 }
 
 func (f *mockPluginClient) Create(_ context.Context, p plugin.Plugin) error {
@@ -60,6 +62,20 @@ func (f *mockPluginClient) ListBlacklist(_ context.Context) ([]plugin.BlacklistE
 		return f.listBlacklist()
 	}
 	return nil, nil
+}
+
+func (f *mockPluginClient) ListStates(_ context.Context) ([]plugin.State, error) {
+	if f.listStates != nil {
+		return f.listStates()
+	}
+	return nil, nil
+}
+
+func (f *mockPluginClient) Patch(_ context.Context, id string, patch plugin.Patch) error {
+	if f.patch != nil {
+		return f.patch(id, patch)
+	}
+	return nil
 }
 
 func Test_loadManifestContent(t *testing.T) {
