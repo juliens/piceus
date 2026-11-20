@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"slices"
 	"strings"
 
 	"github.com/google/go-github/v57/github"
@@ -91,24 +92,46 @@ func (s *Scrapper) upToDate(ctx context.Context, name, latestVersion string, sta
 }
 
 // recordTagsETag records the tags ETag of a known plugin, so the next run gets a 304.
-// An error is only logged: the plugin itself is fine.
 func (s *Scrapper) recordTagsETag(ctx context.Context, state plugin.State, tagsETag string) {
 	if tagsETag == "" || tagsETag == state.TagsETag {
 		return
 	}
 
-	patch := plugin.Patch{TagsETag: &tagsETag}
+	s.patchPlugin(ctx, state, plugin.Patch{TagsETag: &tagsETag})
+}
 
-	logger := log.Ctx(ctx).With().Str("module_name", state.Name).Logger()
+// recordRepositoryState records the stars and the hidden flag of a known plugin when they changed.
+// The plugin is not read again: its tags did not change.
+func (s *Scrapper) recordRepositoryState(ctx context.Context, state plugin.State, repository *github.Repository) {
+	var patch plugin.Patch
+
+	if stars := repository.GetStargazersCount(); stars != state.Stars {
+		patch.Stars = new(stars)
+	}
+
+	if hidden := slices.Contains(repository.Topics, hiddenTopic); hidden != state.Hidden {
+		patch.Hidden = new(hidden)
+	}
+
+	if patch.IsEmpty() {
+		return
+	}
+
+	s.patchPlugin(ctx, state, patch)
+}
+
+// patchPlugin updates only the fields of the patch for a known plugin.
+// An error is only logged: the plugin itself is fine, and the next run tries again.
+func (s *Scrapper) patchPlugin(ctx context.Context, state plugin.State, patch plugin.Patch) {
+	logger := log.Ctx(ctx).With().Str("module_name", state.Name).Interface("patch", patch).Logger()
 
 	if s.dryRun {
-		logger.Info().Msg("Dry run, not recording the tags ETag")
-		logger.Debug().Interface("patch", patch).Send()
+		logger.Info().Msg("Dry run, not patching the plugin")
 
 		return
 	}
 
 	if err := s.pg.Patch(ctx, state.ID, patch); err != nil {
-		logger.Error().Err(err).Msg("Failed to record the tags ETag")
+		logger.Error().Err(err).Msg("Failed to patch the plugin")
 	}
 }

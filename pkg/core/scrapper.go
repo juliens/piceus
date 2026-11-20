@@ -321,12 +321,10 @@ func (s *Scrapper) process(ctx context.Context, repository *github.Repository) (
 	tags, tagsETag, notModified, err := s.getTags(ctx, repository, state.TagsETag)
 	if err == nil && notModified {
 		// The tags did not change since the last run: neither did the plugin.
-		if state.Stars == repository.GetStargazersCount() {
-			return nil, nil
-		}
+		// Its stars and its hidden flag come from the repository: they are updated alone.
+		s.recordRepositoryState(ctx, state, repository)
 
-		// The stars changed: the plugin is read again, as before the ETag.
-		tags, tagsETag, _, err = s.getTags(ctx, repository, "")
+		return nil, nil
 	}
 
 	// The tags changed since the ETag was recorded: plugin-service is updated even when the latest version is the same.
@@ -410,9 +408,11 @@ func (s *Scrapper) process(ctx context.Context, repository *github.Repository) (
 		return nil, err
 	}
 
-	// plugin-service already has this version, or the plugin is disabled: record the ETag, so the next run gets a 304.
+	// plugin-service already has this version, or the plugin is disabled.
 	if pluginName == "" {
-		if known {
+		// The ETag is recorded only when plugin-service has the latest version of these tags: the next run gets a 304.
+		// A disabled plugin is not updated: with the ETag of its new tags, it would keep its old version once enabled again.
+		if known && !tagsChanged && state.LatestVersion == latestVersion {
 			s.recordTagsETag(ctx, state, tagsETag)
 		}
 

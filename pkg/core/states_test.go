@@ -103,6 +103,9 @@ func TestScrapper_process_states(t *testing.T) {
 		"GET /repos/{owner}/{repo}/readme":             1,
 	}
 
+	// tagsOnly is the request of a plugin whose tags did not change: a 304 is not counted in the GitHub rate limit.
+	tagsOnly := map[string]int{"GET /repos/{owner}/{repo}/tags": 1}
+
 	testCases := []struct {
 		desc string
 		// state is the plugin state in plugin-service, nil when the plugin is not known.
@@ -120,20 +123,45 @@ func TestScrapper_process_states(t *testing.T) {
 			desc:     "tags not modified",
 			state:    &known,
 			stars:    3,
-			requests: map[string]int{"GET /repos/{owner}/{repo}/tags": 1},
+			requests: tagsOnly,
 		},
 		{
-			// The plugin is read again, as before the ETag: the hidden flag is only written with the plugin.
-			desc:   "tags not modified, stars changed",
-			state:  &known,
-			stars:  4,
-			hidden: true,
-			requests: map[string]int{
-				"GET /repos/{owner}/{repo}/tags":               2,
-				"GET /repos/{owner}/{repo}/contents/{path...}": 2,
-				"GET /repos/{owner}/{repo}/readme":             1,
-			},
-			stored: true,
+			// The plugin is not read again: only its stars are updated.
+			desc:     "tags not modified, stars changed",
+			state:    &known,
+			stars:    4,
+			requests: tagsOnly,
+			patch:    &plugin.Patch{Stars: new(4)},
+		},
+		{
+			desc:     "tags not modified, hidden changed",
+			state:    &known,
+			stars:    3,
+			hidden:   true,
+			requests: tagsOnly,
+			patch:    &plugin.Patch{Hidden: new(true)},
+		},
+		{
+			desc:     "tags not modified, no longer hidden",
+			state:    &plugin.State{ID: "id1", Name: "github.com/traefik/plugintestsimple", LatestVersion: "v1.0.0", Stars: 3, Hidden: true, TagsETag: etag},
+			stars:    3,
+			requests: tagsOnly,
+			patch:    &plugin.Patch{Hidden: new(false)},
+		},
+		{
+			desc:     "tags not modified, stars and hidden changed",
+			state:    &known,
+			stars:    4,
+			hidden:   true,
+			requests: tagsOnly,
+			patch:    &plugin.Patch{Stars: new(4), Hidden: new(true)},
+		},
+		{
+			desc:     "tags not modified, stars changed, dry run",
+			state:    &known,
+			stars:    4,
+			dryRun:   true,
+			requests: tagsOnly,
 		},
 		{
 			desc:     "tags changed, same latest version",
@@ -143,15 +171,33 @@ func TestScrapper_process_states(t *testing.T) {
 			stored:   true,
 		},
 		{
-			desc:     "disabled plugin: the ETag is recorded",
-			state:    &plugin.State{ID: "id1", Name: "github.com/traefik/plugintestsimple", Disabled: true},
+			desc:     "disabled plugin at its latest version: the ETag is recorded",
+			state:    &plugin.State{ID: "id1", Name: "github.com/traefik/plugintestsimple", LatestVersion: "v1.0.0", Disabled: true},
 			requests: fullRead,
 			patch:    &plugin.Patch{TagsETag: new(etag)},
 		},
 		{
+			// With the ETag of the new tags, the plugin would keep its old version once enabled again.
+			desc:     "disabled plugin with a new tag: the ETag is not recorded",
+			state:    &plugin.State{ID: "id1", Name: "github.com/traefik/plugintestsimple", LatestVersion: "v0.9.0", Disabled: true},
+			requests: fullRead,
+		},
+		{
+			desc:     "disabled plugin, tags changed: the ETag is not recorded",
+			state:    &plugin.State{ID: "id1", Name: "github.com/traefik/plugintestsimple", LatestVersion: "v1.0.0", Disabled: true, TagsETag: `"old"`},
+			requests: fullRead,
+		},
+		{
 			desc:     "disabled plugin, tags not modified",
 			state:    &plugin.State{ID: "id1", Name: "github.com/traefik/plugintestsimple", Disabled: true, TagsETag: etag},
-			requests: map[string]int{"GET /repos/{owner}/{repo}/tags": 1},
+			requests: tagsOnly,
+		},
+		{
+			desc:     "disabled plugin, tags not modified, stars changed",
+			state:    &plugin.State{ID: "id1", Name: "github.com/traefik/plugintestsimple", Disabled: true, TagsETag: etag},
+			stars:    4,
+			requests: tagsOnly,
+			patch:    &plugin.Patch{Stars: new(4)},
 		},
 		{
 			// The other module of the repository is disabled, not this one.
