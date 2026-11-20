@@ -686,7 +686,7 @@ func TestScrapper_Run_rateLimited(t *testing.T) {
 		})
 	})
 	mux.HandleFunc("GET /repos/traefik/plugintestsimple/tags", func(rw http.ResponseWriter, _ *http.Request) {
-		rw.Header().Set("X-RateLimit-Remaining", "0")
+		rw.Header().Set("X-Ratelimit-Remaining", "0")
 		writeJSON(t, rw, http.StatusForbidden, github.ErrorResponse{Message: "API rate limit exceeded"})
 	})
 	mux.HandleFunc("POST /repos/traefik/plugintestsimple/issues", func(rw http.ResponseWriter, _ *http.Request) {
