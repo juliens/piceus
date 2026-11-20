@@ -19,6 +19,7 @@ import (
 	"github.com/google/go-github/v57/github"
 	"github.com/ldez/grignotin/goproxy"
 	"github.com/pelletier/go-toml"
+	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	pfile "github.com/traefik/paerser/file"
 	"github.com/traefik/piceus/internal/plugin"
@@ -84,7 +85,11 @@ type Scrapper struct {
 	blacklist    map[string]struct{}
 	// states are the plugin states by repository (owner/repo in lower case), loaded at the start of each Run.
 	states map[string][]plugin.State
-	tracer oteltrace.Tracer
+	// statesByName are the same plugin states by plugin name.
+	statesByName map[string][]plugin.State
+	// statesLoaded is false when the states could not be loaded.
+	statesLoaded bool
+	tracer       oteltrace.Tracer
 }
 
 // NewScrapper creates a new Scrapper instance.
@@ -259,6 +264,8 @@ func (s *Scrapper) search(ctx context.Context) ([]*github.Repository, error) {
 
 	var all []*github.Repository
 
+	seen := map[string]struct{}{}
+
 	for _, query := range s.searchQueries {
 		for {
 			repositories, resp, err := s.gh.Search.Repositories(ctx, query, opts)
@@ -267,7 +274,16 @@ func (s *Scrapper) search(ctx context.Context) ([]*github.Repository, error) {
 				return nil, err
 			}
 
-			all = append(all, repositories.Repositories...)
+			for _, repository := range repositories.Repositories {
+				// A repository can match several queries: it is processed once.
+				if _, ok := seen[repository.GetFullName()]; ok {
+					continue
+				}
+
+				seen[repository.GetFullName()] = struct{}{}
+				all = append(all, repository)
+			}
+
 			if resp.NextPage == 0 {
 				break
 			}
@@ -302,17 +318,19 @@ func (s *Scrapper) process(ctx context.Context, repository *github.Repository) (
 
 	state, known := s.stateOf(repository)
 
-	if known && state.Disabled {
-		log.Ctx(ctx).Debug().Msg("Disabled plugin, skipped")
-		return nil, nil
-	}
-
 	tags, tagsETag, notModified, err := s.getTags(ctx, repository, state.TagsETag)
 	if err == nil && notModified {
 		// The tags did not change since the last run: neither did the plugin.
-		s.patchState(ctx, state, repository, "")
-		return nil, nil
+		if state.Stars == repository.GetStargazersCount() {
+			return nil, nil
+		}
+
+		// The stars changed: the plugin is read again, as before the ETag.
+		tags, tagsETag, _, err = s.getTags(ctx, repository, "")
 	}
+
+	// The tags changed since the ETag was recorded: plugin-service is updated even when the latest version is the same.
+	tagsChanged := err == nil && known && state.TagsETag != "" && state.TagsETag != tagsETag
 
 	if err == nil && len(tags) == 0 {
 		err = errors.New("missing tag/version")
@@ -325,9 +343,15 @@ func (s *Scrapper) process(ctx context.Context, repository *github.Repository) (
 
 	latestVersion := tags[0].Name
 
+	// tagRef is the commit of the tag: unlike the tag, it cannot move during the run.
+	tagRef := latestVersion
+	if tags[0].SHA != "" {
+		tagRef = tags[0].SHA
+	}
+
 	// Gets manifestFile
 
-	manifest, err := s.loadManifest(ctx, repository, latestVersion)
+	manifest, err := s.loadManifest(ctx, repository, tagRef)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
@@ -335,19 +359,19 @@ func (s *Scrapper) process(ctx context.Context, repository *github.Repository) (
 
 	// The code is read at the pinned commit: so are its manifest and readme.
 
-	ref := latestVersion
+	ref := tagRef
 
 	// mod is the go.mod read at the tag, to read it only once.
 	var mod *modfile.File
 
 	if manifest.Runtime != wasmRuntime {
-		ref, mod, err = s.yaegiRef(ctx, repository, tags[0])
+		ref, mod, err = s.yaegiRef(ctx, repository, tags[0], tagRef)
 		if err != nil {
 			span.RecordError(err)
 			return nil, err
 		}
 
-		if ref != latestVersion {
+		if ref != tagRef {
 			manifest, err = s.loadManifest(ctx, repository, ref)
 			if err != nil {
 				span.RecordError(err)
@@ -362,8 +386,8 @@ func (s *Scrapper) process(ctx context.Context, repository *github.Repository) (
 
 	// A readme added after publication is only at the tag.
 	errResp := &github.ErrorResponse{}
-	if ref != latestVersion && errors.As(err, &errResp) && errResp.Response.StatusCode == http.StatusNotFound {
-		readme, err = s.loadReadme(ctx, repository, latestVersion)
+	if ref != tagRef && errors.As(err, &errResp) && errResp.Response.StatusCode == http.StatusNotFound {
+		readme, err = s.loadReadme(ctx, repository, tagRef)
 	}
 
 	if err != nil {
@@ -376,9 +400,9 @@ func (s *Scrapper) process(ctx context.Context, repository *github.Repository) (
 
 	switch manifest.Runtime {
 	case wasmRuntime:
-		pluginName, versions, err = s.verifyWASMPlugin(ctx, repository, tags, manifest)
+		pluginName, versions, err = s.verifyWASMPlugin(ctx, repository, tags, tagsChanged, manifest)
 	default:
-		pluginName, versions, err = s.verifyYaegiPlugin(ctx, repository, tags, ref, mod, manifest)
+		pluginName, versions, err = s.verifyYaegiPlugin(ctx, repository, tags, tagsChanged, ref, mod, manifest)
 	}
 
 	if err != nil {
@@ -386,10 +410,10 @@ func (s *Scrapper) process(ctx context.Context, repository *github.Repository) (
 		return nil, err
 	}
 
-	// plugin-service already has this version: record the ETag, so the next run gets a 304.
+	// plugin-service already has this version, or the plugin is disabled: record the ETag, so the next run gets a 304.
 	if pluginName == "" {
 		if known {
-			s.patchState(ctx, state, repository, tagsETag)
+			s.recordTagsETag(ctx, state, tagsETag)
 		}
 
 		return nil, nil
@@ -548,6 +572,9 @@ func (s *Scrapper) getVersions(ctx context.Context, moduleName string, tags []ta
 	return versions, err
 }
 
+// expSemver matches a semantic version tag.
+var expSemver = regexp.MustCompile(`^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$`)
+
 // tag is a Git tag of the plugin repository.
 type tag struct {
 	Name string
@@ -585,8 +612,6 @@ func (s *Scrapper) getTags(ctx context.Context, repository *github.Repository, e
 		return nil, "", false, fmt.Errorf("failed to get versions: %w", err)
 	}
 
-	expSemver := regexp.MustCompile(`^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$`)
-
 	for _, t := range tags {
 		name := t.GetName()
 		if name == "" {
@@ -601,6 +626,23 @@ func (s *Scrapper) getTags(ctx context.Context, repository *github.Repository, e
 	}
 
 	return result, resp.Header.Get("ETag"), false, nil
+}
+
+// create creates a plugin that plugin-service does not return.
+func (s *Scrapper) create(ctx context.Context, logger zerolog.Logger, data *plugin.Plugin) error {
+	// GetByName does not return a disabled plugin: without the states, it could be a disabled one.
+	if !s.statesLoaded {
+		logger.Warn().Msg("Plugin states not loaded, not creating the plugin")
+		return nil
+	}
+
+	if err := s.pg.Create(ctx, *data); err != nil {
+		return err
+	}
+
+	logger.Info().Msg("Stored")
+
+	return nil
 }
 
 func (s *Scrapper) store(ctx context.Context, data *plugin.Plugin) error {
@@ -621,13 +663,7 @@ func (s *Scrapper) store(ctx context.Context, data *plugin.Plugin) error {
 		if errors.As(err, &notFoundError) && notFoundError.StatusCode == http.StatusNotFound {
 			logger.Debug().Err(err).Msg("fallback")
 
-			err = s.pg.Create(ctx, *data)
-			if err != nil {
-				return err
-			}
-
-			logger.Info().Msg("Stored")
-			return nil
+			return s.create(ctx, logger, data)
 		}
 
 		return fmt.Errorf("API error on %s: %w", data.Name, err)

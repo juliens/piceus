@@ -86,14 +86,22 @@ func TestScrapper_process_states(t *testing.T) {
 	goMod, err := os.ReadFile(filepath.Join(fixtureDir, "go.mod"))
 	require.NoError(t, err)
 
+	// The files are read at the commit of the tag.
 	files := map[string]string{
-		manifestFile + "@v1.0.0": string(manifest) + "\ntestData: {}\n",
-		"go.mod@v1.0.0":          string(goMod),
+		manifestFile + "@abc123": string(manifest) + "\ntestData: {}\n",
+		"go.mod@abc123":          string(goMod),
 	}
 
 	const etag = `"abc"`
 
 	known := plugin.State{ID: "id1", Name: "github.com/traefik/plugintestsimple", LatestVersion: "v1.0.0", Stars: 3, TagsETag: etag}
+
+	// fullRead are the requests to read the plugin again.
+	fullRead := map[string]int{
+		"GET /repos/{owner}/{repo}/tags":               1,
+		"GET /repos/{owner}/{repo}/contents/{path...}": 2,
+		"GET /repos/{owner}/{repo}/readme":             1,
+	}
 
 	testCases := []struct {
 		desc string
@@ -115,46 +123,64 @@ func TestScrapper_process_states(t *testing.T) {
 			requests: map[string]int{"GET /repos/{owner}/{repo}/tags": 1},
 		},
 		{
-			desc:     "tags not modified, stars and hidden changed",
-			state:    &known,
-			stars:    4,
-			hidden:   true,
-			requests: map[string]int{"GET /repos/{owner}/{repo}/tags": 1},
-			patch:    &plugin.Patch{Stars: new(4), Hidden: new(true)},
-		},
-		{
-			desc:     "tags not modified, dry run",
-			state:    &known,
-			stars:    4,
-			dryRun:   true,
-			requests: map[string]int{"GET /repos/{owner}/{repo}/tags": 1},
-		},
-		{
-			desc:     "disabled plugin",
-			state:    &plugin.State{ID: "id1", Name: "github.com/traefik/plugintestsimple", Disabled: true},
-			requests: map[string]int{},
-		},
-		{
-			desc:  "first run with states: the ETag is recorded",
-			state: &plugin.State{ID: "id1", Name: "github.com/traefik/plugintestsimple", LatestVersion: "v1.0.0", Stars: 3},
-			prev:  &plugin.Plugin{ID: "id1", Name: "github.com/traefik/plugintestsimple", LatestVersion: "v1.0.0", Stars: 3},
-			stars: 3,
+			// The plugin is read again, as before the ETag: the hidden flag is only written with the plugin.
+			desc:   "tags not modified, stars changed",
+			state:  &known,
+			stars:  4,
+			hidden: true,
 			requests: map[string]int{
-				"GET /repos/{owner}/{repo}/tags":               1,
-				"GET /repos/{owner}/{repo}/contents/{path...}": 2,
-				"GET /repos/{owner}/{repo}/readme":             1,
-			},
-			patch: &plugin.Patch{TagsETag: new(etag)},
-		},
-		{
-			desc:  "new plugin",
-			stars: 3,
-			requests: map[string]int{
-				"GET /repos/{owner}/{repo}/tags":               1,
+				"GET /repos/{owner}/{repo}/tags":               2,
 				"GET /repos/{owner}/{repo}/contents/{path...}": 2,
 				"GET /repos/{owner}/{repo}/readme":             1,
 			},
 			stored: true,
+		},
+		{
+			desc:     "tags changed, same latest version",
+			state:    &plugin.State{ID: "id1", Name: "github.com/traefik/plugintestsimple", LatestVersion: "v1.0.0", Stars: 3, TagsETag: `"old"`},
+			stars:    3,
+			requests: fullRead,
+			stored:   true,
+		},
+		{
+			desc:     "disabled plugin: the ETag is recorded",
+			state:    &plugin.State{ID: "id1", Name: "github.com/traefik/plugintestsimple", Disabled: true},
+			requests: fullRead,
+			patch:    &plugin.Patch{TagsETag: new(etag)},
+		},
+		{
+			desc:     "disabled plugin, tags not modified",
+			state:    &plugin.State{ID: "id1", Name: "github.com/traefik/plugintestsimple", Disabled: true, TagsETag: etag},
+			requests: map[string]int{"GET /repos/{owner}/{repo}/tags": 1},
+		},
+		{
+			// The other module of the repository is disabled, not this one.
+			desc:     "disabled plugin with another module name",
+			state:    &plugin.State{ID: "id1", Name: "github.com/traefik/plugintestsimple/v2", Disabled: true},
+			stars:    3,
+			requests: fullRead,
+			stored:   true,
+		},
+		{
+			// The loaded state tells that plugin-service has this version: GetByName is not called (prev is nil).
+			desc:     "first run with states: the ETag is recorded",
+			state:    &plugin.State{ID: "id1", Name: "github.com/traefik/plugintestsimple", LatestVersion: "v1.0.0", Stars: 3},
+			stars:    3,
+			requests: fullRead,
+			patch:    &plugin.Patch{TagsETag: new(etag)},
+		},
+		{
+			desc:     "first run with states, dry run",
+			state:    &plugin.State{ID: "id1", Name: "github.com/traefik/plugintestsimple", LatestVersion: "v1.0.0", Stars: 3},
+			stars:    3,
+			dryRun:   true,
+			requests: fullRead,
+		},
+		{
+			desc:     "new plugin",
+			stars:    3,
+			requests: fullRead,
+			stored:   true,
 		},
 	}
 
@@ -164,7 +190,7 @@ func TestScrapper_process_states(t *testing.T) {
 
 			gh := fakeGitHub{
 				files:    files,
-				readmes:  map[string]string{"v1.0.0": "# Plugin"},
+				readmes:  map[string]string{"abc123": "# Plugin"},
 				tagSHA:   "abc123",
 				tagsETag: etag,
 				requests: requests,
@@ -222,6 +248,8 @@ func TestScrapper_process_states(t *testing.T) {
 
 			require.NotNil(t, p)
 			assert.Equal(t, etag, p.TagsETag)
+			assert.Equal(t, test.stars, p.Stars)
+			assert.Equal(t, test.hidden, p.Hidden)
 		})
 	}
 }

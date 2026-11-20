@@ -2,7 +2,6 @@ package core
 
 import (
 	"context"
-	"slices"
 	"strings"
 
 	"github.com/google/go-github/v57/github"
@@ -14,14 +13,20 @@ import (
 // Without the states, every plugin is read again from GitHub, as before.
 func (s *Scrapper) loadStates(ctx context.Context) {
 	s.states = map[string][]plugin.State{}
+	s.statesByName = map[string][]plugin.State{}
+	s.statesLoaded = false
 
 	states, err := s.pg.ListStates(ctx)
 	if err != nil {
-		log.Ctx(ctx).Warn().Err(err).Msg("Unable to load the plugin states: every plugin is read again from GitHub")
+		log.Ctx(ctx).Warn().Err(err).Msg("Unable to load the plugin states: every plugin is read again from GitHub, and no plugin is created")
 		return
 	}
 
+	s.statesLoaded = true
+
 	for _, state := range states {
+		s.statesByName[state.Name] = append(s.statesByName[state.Name], state)
+
 		key := repoKey(state.Name)
 		if key == "" {
 			continue
@@ -61,37 +66,49 @@ func (s *Scrapper) stateOf(repository *github.Repository) (plugin.State, bool) {
 	return states[0], true
 }
 
-// patchState updates the stars, the hidden flag and the tags ETag of a known plugin, only when they changed.
+// isDisabled reports whether a plugin with this name is disabled in plugin-service.
+// GetByName does not return a disabled plugin: without this check, store would create it again.
+func (s *Scrapper) isDisabled(name string) bool {
+	for _, state := range s.statesByName[name] {
+		if state.Disabled {
+			return true
+		}
+	}
+
+	return false
+}
+
+// upToDate reports whether plugin-service already has this latest version and these stars for the plugin.
+// It uses the loaded state when there is exactly one plugin with this name, and asks plugin-service otherwise.
+func (s *Scrapper) upToDate(ctx context.Context, name, latestVersion string, stars int) bool {
+	if states := s.statesByName[name]; len(states) == 1 {
+		return states[0].LatestVersion == latestVersion && states[0].Stars == stars
+	}
+
+	prev, err := s.pg.GetByName(ctx, name)
+
+	return err == nil && prev != nil && prev.LatestVersion == latestVersion && prev.Stars == stars
+}
+
+// recordTagsETag records the tags ETag of a known plugin, so the next run gets a 304.
 // An error is only logged: the plugin itself is fine.
-func (s *Scrapper) patchState(ctx context.Context, state plugin.State, repository *github.Repository, tagsETag string) {
-	var patch plugin.Patch
-
-	if stars := repository.GetStargazersCount(); stars != state.Stars {
-		patch.Stars = &stars
-	}
-
-	if hidden := slices.Contains(repository.Topics, hiddenTopic); hidden != state.Hidden {
-		patch.Hidden = &hidden
-	}
-
-	if tagsETag != "" && tagsETag != state.TagsETag {
-		patch.TagsETag = &tagsETag
-	}
-
-	if patch.IsEmpty() {
+func (s *Scrapper) recordTagsETag(ctx context.Context, state plugin.State, tagsETag string) {
+	if tagsETag == "" || tagsETag == state.TagsETag {
 		return
 	}
+
+	patch := plugin.Patch{TagsETag: &tagsETag}
 
 	logger := log.Ctx(ctx).With().Str("module_name", state.Name).Logger()
 
 	if s.dryRun {
-		logger.Info().Msg("Dry run, not updating the plugin state")
+		logger.Info().Msg("Dry run, not recording the tags ETag")
 		logger.Debug().Interface("patch", patch).Send()
 
 		return
 	}
 
 	if err := s.pg.Patch(ctx, state.ID, patch); err != nil {
-		logger.Error().Err(err).Msg("Failed to update the plugin state")
+		logger.Error().Err(err).Msg("Failed to record the tags ETag")
 	}
 }

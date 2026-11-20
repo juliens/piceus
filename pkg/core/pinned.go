@@ -20,37 +20,37 @@ var errPinnedCommit = errors.New("failed to get the commit pinned by the Go modu
 type PinnedCommit func(ctx context.Context, module, version string) (string, error)
 
 // yaegiRef returns the ref to read the Yaegi plugin from: the commit the Go module proxy pinned at publication,
-// that plugin-service serves once the tag moved, or the tag when the proxy pinned none.
-// When the ref is the tag, it also returns the go.mod read at the tag, or nil when it did not read it.
-func (s *Scrapper) yaegiRef(ctx context.Context, repository *github.Repository, latest tag) (string, *modfile.File, error) {
+// that plugin-service serves once the tag moved, or tagRef (the tag, read at its commit when known) when the proxy pinned none.
+// When the ref is tagRef, it also returns the go.mod read at tagRef, or nil when it did not read it.
+func (s *Scrapper) yaegiRef(ctx context.Context, repository *github.Repository, latest tag, tagRef string) (string, *modfile.File, error) {
 	version := latest.Name
 
 	// The Go module proxy cannot fetch a private repository: do not send it its name.
 	if s.pinnedCommit == nil || repository.GetPrivate() {
-		return version, nil, nil
+		return tagRef, nil, nil
 	}
 
-	mod, err := s.getModuleInfo(ctx, repository, version)
+	mod, err := s.getModuleInfo(ctx, repository, tagRef)
 	if err != nil {
 		return "", nil, err
 	}
 
 	if mod.Module == nil {
-		return version, mod, nil
+		return tagRef, mod, nil
 	}
 
 	pinned, err := s.pinnedCommitWithRetry(ctx, mod.Module.Mod.Path, version)
 
 	switch {
 	case errors.Is(err, audit.ErrNotPinned):
-		return version, mod, nil
+		return tagRef, mod, nil
 	case err != nil:
 		return "", nil, fmt.Errorf("%w: %w", errPinnedCommit, err)
 	}
 
-	// The tag did not move: the files at the tag are the pinned ones.
+	// The tag did not move: the files at the tag commit are the pinned ones.
 	if latest.SHA != "" && strings.EqualFold(pinned, latest.SHA) {
-		return version, mod, nil
+		return tagRef, mod, nil
 	}
 
 	// plugin-service serves the tag once the pinned commit is gone from GitHub.
@@ -60,7 +60,7 @@ func (s *Scrapper) yaegiRef(ctx context.Context, repository *github.Repository, 
 	}
 
 	if gone {
-		return version, mod, nil
+		return tagRef, mod, nil
 	}
 
 	return pinned, nil, nil

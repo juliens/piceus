@@ -67,6 +67,11 @@ func (rl *adaptiveRateLimiterTripper) RoundTrip(req *http.Request) (*http.Respon
 		Time("reset", rl.resetTime).
 		Msg("Updated rate limit info from GitHub responses")
 
+	// A 304 does not count in the GitHub rate limit: there is no reason to wait after it.
+	if resp.StatusCode == http.StatusNotModified {
+		return resp, err
+	}
+
 	if shouldWait, waitTime := rl.shouldWait(); shouldWait {
 		log.Debug().
 			Dur("waitTime", waitTime).

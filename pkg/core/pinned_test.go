@@ -56,9 +56,9 @@ func TestScrapper_yaegiRef(t *testing.T) {
 		proxyErr bool
 	}{
 		{desc: "pinned", results: []error{nil}, ref: "abc123", calls: 1},
-		{desc: "pinned commit is the tag commit", tagSHA: "ABC123", results: []error{nil}, ref: "v1.0.0", withMod: true, calls: 1},
+		{desc: "pinned commit is the tag commit", tagSHA: "ABC123", results: []error{nil}, ref: "ABC123", withMod: true, calls: 1},
 		{desc: "tag moved", tagSHA: "def456", results: []error{nil}, ref: "abc123", calls: 1},
-		{desc: "pinned commit is the tag commit, commit check down", repo: "down", tagSHA: "abc123", results: []error{nil}, ref: "v1.0.0", withMod: true, calls: 1},
+		{desc: "pinned commit is the tag commit, commit check down", repo: "down", tagSHA: "abc123", results: []error{nil}, ref: "abc123", withMod: true, calls: 1},
 		{desc: "not pinned", results: []error{audit.ErrNotPinned}, ref: "v1.0.0", withMod: true, calls: 1},
 		{desc: "proxy back after a hiccup", results: []error{errors.New("502"), nil}, ref: "abc123", calls: 2},
 		{desc: "proxy down", results: []error{errors.New("502")}, calls: 3, wantErr: true, proxyErr: true},
@@ -75,6 +75,8 @@ func TestScrapper_yaegiRef(t *testing.T) {
 			files := map[string]string{
 				"go.mod@v1.0.0": "module github.com/o/r\n",
 				"go.mod@abc123": "module github.com/o/r\n",
+				"go.mod@ABC123": "module github.com/o/r\n",
+				"go.mod@def456": "module github.com/o/r\n",
 			}
 
 			s := Scrapper{gh: newFakeGitHub(t, files, nil), tracer: otel.GetTracerProvider().Tracer("test")}
@@ -86,7 +88,7 @@ func TestScrapper_yaegiRef(t *testing.T) {
 
 			repository := &github.Repository{Name: new(repo), Owner: &github.User{Login: new("o")}, Private: new(test.private)}
 
-			ref, mod, err := s.yaegiRef(t.Context(), repository, tag{Name: "v1.0.0", SHA: test.tagSHA})
+			ref, mod, err := s.yaegiRef(t.Context(), repository, tag{Name: "v1.0.0", SHA: test.tagSHA}, cmp.Or(test.tagSHA, "v1.0.0"))
 			if calls != nil {
 				assert.Equal(t, test.calls, *calls)
 			}
@@ -219,15 +221,16 @@ func TestScrapper_process_githubRequests(t *testing.T) {
 	goMod, err := os.ReadFile(filepath.Join(fixtureDir, "go.mod"))
 	require.NoError(t, err)
 
+	// The files are read at the commit of the tag, not at the tag: a tag can move.
 	files := map[string]string{
-		manifestFile + "@v1.0.0": string(manifest) + "\ntestData: {}\n",
-		"go.mod@v1.0.0":          string(goMod),
+		manifestFile + "@abc123": string(manifest) + "\ntestData: {}\n",
+		"go.mod@abc123":          string(goMod),
 	}
 
 	requests := map[string]int{}
 
 	// The Go module proxy pinned the commit of the tag.
-	gh := fakeGitHub{files: files, readmes: map[string]string{"v1.0.0": "# Plugin"}, tagSHA: "abc123", requests: requests}.client(t)
+	gh := fakeGitHub{files: files, readmes: map[string]string{"abc123": "# Plugin"}, tagSHA: "abc123", requests: requests}.client(t)
 
 	s := NewScrapper(gh, newFakeGoProxy(t, http.StatusOK), &mockPluginClient{}, true,
 		func(context.Context, string, string) (string, error) { return "abc123", nil },

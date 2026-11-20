@@ -163,25 +163,24 @@ func Test_loadManifestContent(t *testing.T) {
 }
 
 func TestScrapper_store(t *testing.T) {
+	notFound := func(_ string) (*plugin.Plugin, error) {
+		return nil, &plugin.APIError{StatusCode: http.StatusNotFound, Message: "not found"}
+	}
+
 	testCases := []struct {
-		desc     string
-		pgClient pluginClient
+		desc         string
+		getByName    func(string) (*plugin.Plugin, error)
+		statesLoaded bool
+		created      bool
+		updated      bool
 	}{
+		{desc: "create", getByName: notFound, statesLoaded: true, created: true},
+		// The plugin could be a disabled one: GetByName does not return it.
+		{desc: "no create without the states", getByName: notFound},
 		{
-			desc: "create",
-			pgClient: &mockPluginClient{
-				getByName: func(_ string) (*plugin.Plugin, error) {
-					return nil, &plugin.APIError{StatusCode: http.StatusNotFound, Message: "not found"}
-				},
-			},
-		},
-		{
-			desc: "update",
-			pgClient: &mockPluginClient{
-				getByName: func(_ string) (*plugin.Plugin, error) {
-					return &plugin.Plugin{ID: "aaaa", Name: "test"}, nil
-				},
-			},
+			desc:      "update",
+			getByName: func(_ string) (*plugin.Plugin, error) { return &plugin.Plugin{ID: "aaaa", Name: "test"}, nil },
+			updated:   true,
 		},
 	}
 
@@ -189,12 +188,23 @@ func TestScrapper_store(t *testing.T) {
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
-			scrapper := NewScrapper(nil, nil, test.pgClient, true, nil, nil, nil)
+			var created, updated bool
 
-			data := &plugin.Plugin{Name: "test"}
+			pgClient := &mockPluginClient{
+				getByName: test.getByName,
+				create:    func(plugin.Plugin) error { created = true; return nil },
+				update:    func(plugin.Plugin) error { updated = true; return nil },
+			}
+
+			scrapper := NewScrapper(nil, nil, pgClient, true, nil, nil, nil)
+			scrapper.statesLoaded = test.statesLoaded
+
+			data := &plugin.Plugin{Name: "test", DisplayName: "Test"}
 			err := scrapper.store(context.Background(), data)
 
 			require.NoError(t, err)
+			assert.Equal(t, test.created, created)
+			assert.Equal(t, test.updated, updated)
 		})
 	}
 }
@@ -697,4 +707,40 @@ func TestScrapper_Run_rateLimited(t *testing.T) {
 
 	err = scrapper.Run(t.Context())
 	require.NoError(t, err)
+}
+
+func TestScrapper_search_dedupe(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		// Both queries find traefik/plugindemo.
+		names := map[string][]string{
+			"q1": {"traefik/plugindemo", "o/a"},
+			"q2": {"traefik/plugindemo", "o/b"},
+		}[req.URL.Query().Get("q")]
+
+		var repositories []*github.Repository
+		for _, name := range names {
+			repositories = append(repositories, &github.Repository{FullName: new(name)})
+		}
+
+		writeJSON(t, rw, http.StatusOK, github.RepositoriesSearchResult{Total: new(len(repositories)), Repositories: repositories})
+	}))
+	t.Cleanup(server.Close)
+
+	gh := github.NewClient(nil)
+
+	var err error
+	gh.BaseURL, err = url.Parse(server.URL + "/")
+	require.NoError(t, err)
+
+	s := NewScrapper(gh, nil, &mockPluginClient{}, true, nil, []string{"q1", "q2"}, nil)
+
+	repositories, err := s.search(t.Context())
+	require.NoError(t, err)
+
+	var names []string
+	for _, repository := range repositories {
+		names = append(names, repository.GetFullName())
+	}
+
+	assert.Equal(t, []string{"traefik/plugindemo", "o/a", "o/b"}, names)
 }

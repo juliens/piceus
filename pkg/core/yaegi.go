@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/go-github/v57/github"
 	"github.com/ldez/grignotin/goproxy"
+	"github.com/rs/zerolog/log"
 	"golang.org/x/mod/modfile"
 )
 
@@ -18,7 +19,8 @@ var errGoProxy = errors.New("failed to read the Go module proxy")
 
 // verifyYaegiPlugin checks the plugin at its latest tag, its go.mod read at ref.
 // mod is the go.mod already read at ref, or nil.
-func (s *Scrapper) verifyYaegiPlugin(ctx context.Context, repository *github.Repository, tags []tag, ref string, mod *modfile.File, manifest Manifest) (string, []string, error) {
+// When tagsChanged is true, the plugin is updated even when plugin-service has its latest version.
+func (s *Scrapper) verifyYaegiPlugin(ctx context.Context, repository *github.Repository, tags []tag, tagsChanged bool, ref string, mod *modfile.File, manifest Manifest) (string, []string, error) {
 	// Gets module information
 	if mod == nil {
 		var err error
@@ -35,14 +37,18 @@ func (s *Scrapper) verifyYaegiPlugin(ctx context.Context, repository *github.Rep
 
 	pluginName := mod.Module.Mod.Path
 
+	if s.isDisabled(pluginName) {
+		log.Ctx(ctx).Debug().Str("module_name", pluginName).Msg("Disabled plugin, skipped")
+		return "", nil, nil
+	}
+
 	// skip already existing plugin
-	prev, err := s.pg.GetByName(ctx, pluginName)
-	if err == nil && prev != nil && prev.LatestVersion == tags[0].Name && prev.Stars == repository.GetStargazersCount() {
+	if !tagsChanged && s.upToDate(ctx, pluginName, tags[0].Name, repository.GetStargazersCount()) {
 		return "", nil, nil
 	}
 
 	// Checks module information
-	err = checkModuleFile(mod, manifest)
+	err := checkModuleFile(mod, manifest)
 	if err != nil {
 		return "", nil, err
 	}

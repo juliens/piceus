@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 
 	"github.com/google/go-github/v57/github"
+	"github.com/rs/zerolog/log"
 )
 
 const wasmFile = "plugin.wasm"
@@ -18,12 +19,17 @@ const wasmFile = "plugin.wasm"
 // maxZipSize is the maximum size of the release zip archive of a WASM plugin.
 const maxZipSize = 256 << 20
 
-func (s *Scrapper) verifyWASMPlugin(ctx context.Context, repository *github.Repository, tags []tag, manifest Manifest) (string, []string, error) {
+// When tagsChanged is true, the plugin is updated even when plugin-service has its latest version.
+func (s *Scrapper) verifyWASMPlugin(ctx context.Context, repository *github.Repository, tags []tag, tagsChanged bool, manifest Manifest) (string, []string, error) {
 	pluginName := path.Join("github.com", repository.GetFullName())
 
+	if s.isDisabled(pluginName) {
+		log.Ctx(ctx).Debug().Str("module_name", pluginName).Msg("Disabled plugin, skipped")
+		return "", nil, nil
+	}
+
 	// skip already existing plugin
-	prev, err := s.pg.GetByName(ctx, pluginName)
-	if err == nil && prev != nil && prev.LatestVersion == tags[0].Name && prev.Stars == repository.GetStargazersCount() {
+	if !tagsChanged && s.upToDate(ctx, pluginName, tags[0].Name, repository.GetStargazersCount()) {
 		return "", nil, nil
 	}
 

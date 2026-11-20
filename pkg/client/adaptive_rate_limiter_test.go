@@ -1,10 +1,14 @@
 package client
 
 import (
+	"context"
+	"net/http"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestAdaptiveRateLimiter_ShouldWait(t *testing.T) {
@@ -81,4 +85,43 @@ func TestAdaptiveRateLimiter_ShouldWait(t *testing.T) {
 			}
 		})
 	}
+}
+
+type statusTripper int
+
+func (s statusTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	header := http.Header{
+		http.CanonicalHeaderKey(headerRateRemaining): {"0"},
+		http.CanonicalHeaderKey(headerRateReset):     {strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10)},
+	}
+
+	return &http.Response{StatusCode: int(s), Header: header, Body: http.NoBody}, nil
+}
+
+func TestAdaptiveRateLimiterTripper_notModified(t *testing.T) {
+	rl := &adaptiveRateLimiterTripper{safetyBuffer: 25, next: statusTripper(http.StatusNotModified)}
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/repos/o/r/tags", nil)
+	require.NoError(t, err)
+
+	// A 304 does not count in the rate limit: no wait, even with no request left.
+	resp, err := rl.RoundTrip(req)
+	require.NoError(t, err)
+
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusNotModified, resp.StatusCode)
+
+	// Any other response waits for the reset.
+	rl.next = statusTripper(http.StatusOK)
+
+	waited, err := rl.RoundTrip(req)
+	if waited != nil {
+		_ = waited.Body.Close()
+	}
+
+	require.ErrorIs(t, err, context.DeadlineExceeded)
 }
